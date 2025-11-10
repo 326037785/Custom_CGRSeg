@@ -65,7 +65,10 @@ Pascal Context
   # Multi-gpu (4-gpu) testing
   sh tools/dist_test.sh local_configs/cgrseg/cgrseg-t_ade20k_160k.py ${CHECKPOINT_FILE} 4 --eval mIoU
   ```
-  
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=nizhenliang/CGRSeg&type=date&legend=top-left)](https://www.star-history.com/#nizhenliang/CGRSeg&type=date&legend=top-left)
+
 ## ✏️ Reference
 If you find CGRSeg useful in your research or applications, please consider giving a star ⭐ and citing using the following BibTeX:
 ```
@@ -78,3 +81,4 @@ If you find CGRSeg useful in your research or applications, please consider givi
   organization={Springer}
 }
 ```
+
