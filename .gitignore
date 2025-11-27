@@ -105,7 +105,8 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-data
+data/*
+!data/get_data.py
 .vscode
 .idea
 
