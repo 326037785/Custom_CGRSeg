@@ -300,11 +300,17 @@ In matrix form:
 
 $$Z = \hat{P} \cdot Y^T \in \mathbb{R}^{B \times K \times C}$$
 
-Alternatively, with attention-based pooling:
+This produces K class-specific prototypes, each being a C-dimensional vector.
+
+**Attention-based Global Context Pooling (used in DPG Head):**
+
+When no per-class predictions are available, an attention-based global context is extracted:
 
 $$W_{att} = \text{softmax}(\text{Conv}_{1\times1}(Y)) \in \mathbb{R}^{B \times 1 \times HW}$$
 
-$$Z = Y \cdot W_{att}^T \in \mathbb{R}^{B \times C \times 1}$$
+$$Z_{global} = Y \cdot W_{att}^T \in \mathbb{R}^{B \times C \times 1 \times 1}$$
+
+This produces a single global context vector used for channel modulation.
 
 **Stage B: Class Space → Pixel Space (Prototype-Guided Modulation)**
 
@@ -407,7 +413,7 @@ def DPG_spatial_pool(x, pool_type='att'):
     
     if pool_type == 'att':
         # Compute spatial attention weights
-        # input_x: [B, C, HW] -> [B, 1, C, HW]
+        # x: [B, C, H, W] -> view to [B, C, HW] -> unsqueeze to [B, 1, C, HW]
         input_x = x.view(B, C, H * W).unsqueeze(1)
         
         # Attention mask via 1x1 conv
@@ -433,13 +439,18 @@ def DPG_head_forward(x, y):
     
     Args:
         x: Features to be refined [B, C, H, W]
-        y: Features for context extraction [B, C, H, W]
-           (In CGRSeg, y = spatial_gather(x, prev_output))
+        y: Input for context extraction. Can be:
+           - Feature map [B, C, H, W] for general attention pooling
+           - Class prototypes [B, C, K, 1] from spatial_gather (K=num_classes)
+             In this case, spatial_pool aggregates K class prototypes into
+             a single global context vector via attention.
     
     Returns:
         out: Refined features [B, C, H, W]
     """
-    # Extract global context (class prototypes)
+    # Extract global context via attention pooling
+    # If y has shape [B, C, K, 1], this pools over K class prototypes
+    # If y has shape [B, C, H, W], this pools over spatial positions
     context = DPG_spatial_pool(y, pool_type='att')  # [B, C, 1, 1]
     
     out = x
@@ -472,6 +483,11 @@ def CGRSeg_DPG_integration(x, prev_output):
     """
     Complete DPG integration in CGRSeg.
     
+    In the actual CGRSeg implementation:
+    1. spatial_gather extracts K class prototypes from x weighted by prev_output
+    2. DPG_head pools these K prototypes into a single global context via attention
+    3. The global context modulates x via channel multiplication
+    
     Args:
         x: Fused features [B, C, H, W]
         prev_output: Initial segmentation logits [B, K, H, W]
@@ -479,11 +495,17 @@ def CGRSeg_DPG_integration(x, prev_output):
     Returns:
         output: Final refined segmentation [B, K, H, W]
     """
-    # Step 1: Pixel → Class (extract class prototypes)
+    # Step 1: Pixel → Class (extract K class prototypes)
+    # Each prototype is a weighted average of pixel features for that class
     context = spatial_gather(x, prev_output)  # [B, C, K, 1]
     
-    # Step 2: Class → Pixel (prototype-guided modulation)
+    # Step 2: Class → Global (pool K prototypes into single context)
+    # DPG_head internally applies spatial_pool to the class prototypes
+    # This aggregates information across all K classes via attention
+    # The result modulates pixel features via channel multiplication
     object_context = DPG_head_forward(x, context)  # [B, C, H, W]
+    # Note: DPG_head.spatial_pool(context) pools [B, C, K, 1] -> [B, C, 1, 1]
+    #       Then applies channel modulation: x * sigmoid(MLP(global_context))
     
     # Step 3: Residual connection
     object_context = object_context + x
