@@ -31,12 +31,22 @@ def download_file(url: str, destination: Path) -> Path:
     return destination
 
 
-def extract_zip(zip_path: Path, target_dir: Path) -> None:
-    """Extract a zip file into the target directory."""
+def extract_zip(zip_path, target_dir):
     print(f"[extract] {zip_path} -> {target_dir}")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        archive.extractall(target_dir)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        # 如果 ZIP 里有一层 top-level 文件夹，就自动剥掉
+        members = z.namelist()
+        root = members[0].split("/")[0]
+
+        if all(m.startswith(root + "/") for m in members):
+            z.extractall(target_dir)
+            # 然后把 target_dir/root/ 下的内容提到 target_dir/
+            extracted_root = target_dir / root
+            for item in extracted_root.iterdir():
+                shutil.move(str(item), target_dir)
+            extracted_root.rmdir()
+        else:
+            z.extractall(target_dir)
 
 
 def download_ade20k(output_dir: Path) -> None:
