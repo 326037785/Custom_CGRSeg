@@ -1,21 +1,23 @@
 #!/usr/bin/env python
 # Copyright (c) OpenMMLab. All rights reserved.
-"""
-CGRSeg Training and Evaluation Script
+"""CGRSeg Training and Evaluation Script (single GPU).
 
-A user-friendly script for single-GPU training and evaluation of CGRSeg models.
-This script provides easy adjustment of hyperparameters for convenient experimentation.
+This script wraps the official OpenMMLab entrypoints into a single, beginner-friendly
+interface. It exposes clear hyperparameters for single-GPU training and evaluation
+based on the default config ``local_configs/cgrseg/cgrseg-t_ade20k_160k.py``.
 
-Usage:
-    # Training
-    python run_cgrseg.py --mode train --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py
+Quick examples
+--------------
+Train:
+    python run_cgrseg.py --mode train
 
-    # Training with custom hyperparameters
-    python run_cgrseg.py --mode train --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
-        --lr 0.0001 --batch-size 4 --max-iters 80000
+Train with overrides:
+    python run_cgrseg.py --mode train \
+        --lr 0.00008 --batch-size 4 --max-iters 80000 \
+        --work-dir ./work_dirs/my_experiment
 
-    # Evaluation
-    python run_cgrseg.py --mode eval --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
+Evaluate:
+    python run_cgrseg.py --mode eval \
         --checkpoint ./work_dirs/cgrseg-t_ade20k_160k/latest.pth
 """
 
@@ -33,14 +35,56 @@ from mmcv.runner import get_dist_info, load_checkpoint
 from mmcv.utils import Config, get_git_hash
 
 from mmseg import __version__
-from mmseg.apis import init_random_seed, set_random_seed, train_segmentor, single_gpu_test
-from mmseg.datasets import build_dataset, build_dataloader
+from mmseg.apis import (
+    init_random_seed,
+    set_random_seed,
+    single_gpu_test,
+    train_segmentor,
+)
+from mmseg.datasets import build_dataloader, build_dataset
 from mmseg.models import build_segmentor
-from mmseg.utils import collect_env, get_device, get_root_logger, setup_multi_processes, build_dp
+from mmseg.utils import (
+    build_dp,
+    collect_env,
+    get_device,
+    get_root_logger,
+    setup_multi_processes,
+)
+
+
+DEFAULT_CONFIG = 'local_configs/cgrseg/cgrseg-t_ade20k_160k.py'
+
+# Central place to tweak the most common hyperparameters when debugging in
+# VSCode/PyCharm. Changing these defaults updates both the CLI help text and
+# the values used by ``run_single_gpu``.
+DEFAULT_HPARAMS = dict(
+    lr=None,
+    batch_size=None,
+    max_iters=None,
+    eval_interval=None,
+    work_dir=None,
+    data_root=None,
+    seed=None,
+    deterministic=False,
+    no_validate=False,
+    resume_from=None,
+    load_from=None,
+    checkpoint=None,
+    show=False,
+    show_dir=None,
+    opacity=0.5,
+    eval_metric='mIoU',
+    gpu_id=0,
+)
 
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Tip for IDE users: edit ``DEFAULT_HPARAMS`` at the top of this file to set
+    your preferred defaults before running in VSCode/PyCharm. The parser reads
+    those values so you don't have to maintain multiple launch configurations.
+    """
     parser = argparse.ArgumentParser(
         description='CGRSeg Training and Evaluation Script',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -70,67 +114,78 @@ Examples:
     parser.add_argument(
         '--config',
         type=str,
-        required=True,
-        help='Path to config file (e.g., local_configs/cgrseg/cgrseg-t_ade20k_160k.py)'
+        default=DEFAULT_CONFIG,
+        help=(
+            'Path to config file. Defaults to the official single-scale ADE20K '
+            f'config: {DEFAULT_CONFIG}'
+        )
     )
     
     # Training hyperparameters
     parser.add_argument(
         '--lr',
         type=float,
-        default=None,
+        default=DEFAULT_HPARAMS['lr'],
         help='Learning rate (default: uses config value, typically 0.00012)'
     )
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=None,
+        default=DEFAULT_HPARAMS['batch_size'],
         help='Batch size per GPU (default: uses config value, typically 4)'
     )
     parser.add_argument(
         '--max-iters',
         type=int,
-        default=None,
+        default=DEFAULT_HPARAMS['max_iters'],
         help='Maximum training iterations (default: uses config value, typically 160000)'
     )
     parser.add_argument(
         '--eval-interval',
         type=int,
-        default=None,
+        default=DEFAULT_HPARAMS['eval_interval'],
         help='Evaluation interval during training (default: uses config value, typically 4000)'
     )
     parser.add_argument(
         '--work-dir',
         type=str,
-        default=None,
+        default=DEFAULT_HPARAMS['work_dir'],
         help='Directory to save logs and checkpoints'
+    )
+    parser.add_argument(
+        '--data-root',
+        type=str,
+        default=DEFAULT_HPARAMS['data_root'],
+        help='Override data root for train/val/test splits (e.g., ./data/ade/ADEChallengeData2016)'
     )
     parser.add_argument(
         '--seed',
         type=int,
-        default=None,
+        default=DEFAULT_HPARAMS['seed'],
         help='Random seed for reproducibility'
     )
     parser.add_argument(
         '--deterministic',
         action='store_true',
+        default=DEFAULT_HPARAMS['deterministic'],
         help='Whether to set deterministic options for CUDNN backend'
     )
     parser.add_argument(
         '--no-validate',
         action='store_true',
+        default=DEFAULT_HPARAMS['no_validate'],
         help='Whether not to evaluate the checkpoint during training'
     )
     parser.add_argument(
         '--resume-from',
         type=str,
-        default=None,
+        default=DEFAULT_HPARAMS['resume_from'],
         help='Checkpoint file to resume training from'
     )
     parser.add_argument(
         '--load-from',
         type=str,
-        default=None,
+        default=DEFAULT_HPARAMS['load_from'],
         help='Checkpoint file to load weights from (for fine-tuning)'
     )
     
@@ -138,30 +193,31 @@ Examples:
     parser.add_argument(
         '--checkpoint',
         type=str,
-        default=None,
+        default=DEFAULT_HPARAMS['checkpoint'],
         help='Checkpoint file for evaluation (required for eval mode)'
     )
     parser.add_argument(
         '--show',
         action='store_true',
+        default=DEFAULT_HPARAMS['show'],
         help='Show prediction results during evaluation'
     )
     parser.add_argument(
         '--show-dir',
         type=str,
-        default=None,
+        default=DEFAULT_HPARAMS['show_dir'],
         help='Directory to save visualization results'
     )
     parser.add_argument(
         '--opacity',
         type=float,
-        default=0.5,
+        default=DEFAULT_HPARAMS['opacity'],
         help='Opacity of painted segmentation map (0-1, default: 0.5)'
     )
     parser.add_argument(
         '--eval-metric',
         type=str,
-        default='mIoU',
+        default=DEFAULT_HPARAMS['eval_metric'],
         help='Evaluation metric (default: mIoU)'
     )
     
@@ -169,17 +225,44 @@ Examples:
     parser.add_argument(
         '--gpu-id',
         type=int,
-        default=0,
+        default=DEFAULT_HPARAMS['gpu_id'],
         help='GPU ID to use (default: 0)'
     )
     
     args = parser.parse_args()
-    
+
     # Validate arguments
+    if not osp.isfile(args.config):
+        parser.error(f'Config file not found: {args.config}')
+
     if args.mode == 'eval' and args.checkpoint is None:
         parser.error('--checkpoint is required for evaluation mode')
-    
+
     return args
+
+
+def _apply_user_overrides(cfg, args):
+    """Apply user-provided CLI overrides to the loaded config."""
+    if args.lr is not None:
+        cfg.optimizer.lr = args.lr
+        print(f'Learning rate set to: {args.lr}')
+
+    if args.batch_size is not None:
+        cfg.data.samples_per_gpu = args.batch_size
+        print(f'Batch size per GPU set to: {args.batch_size}')
+
+    if args.max_iters is not None:
+        cfg.runner.max_iters = args.max_iters
+        # Save at least the final checkpoint when the interval is absent in cfg
+        if cfg.checkpoint_config is not None:
+            cfg.checkpoint_config.interval = args.max_iters
+        print(f'Maximum iterations set to: {args.max_iters}')
+
+    if args.eval_interval is not None and cfg.get('evaluation'):
+        cfg.evaluation.interval = args.eval_interval
+        print(f'Evaluation interval set to: {args.eval_interval}')
+
+    return cfg
 
 
 def train(args):
@@ -190,25 +273,15 @@ def train(args):
         args: Parsed command line arguments
     """
     cfg = Config.fromfile(args.config)
+    cfg = _apply_user_overrides(cfg, args)
     
-    # Override hyperparameters if specified
-    if args.lr is not None:
-        cfg.optimizer.lr = args.lr
-        print(f'Learning rate set to: {args.lr}')
-    
-    if args.batch_size is not None:
-        cfg.data.samples_per_gpu = args.batch_size
-        print(f'Batch size per GPU set to: {args.batch_size}')
-    
-    if args.max_iters is not None:
-        cfg.runner.max_iters = args.max_iters
-        cfg.checkpoint_config.interval = args.max_iters  # Save final checkpoint
-        print(f'Maximum iterations set to: {args.max_iters}')
-    
-    if args.eval_interval is not None:
-        cfg.evaluation.interval = args.eval_interval
-        print(f'Evaluation interval set to: {args.eval_interval}')
-    
+    # Optional data root override
+    if args.data_root is not None:
+        for split in ['train', 'val', 'test']:
+            if split in cfg.data:
+                cfg.data[split].data_root = args.data_root
+        print(f'Data root set to: {args.data_root}')
+
     # Set work directory
     if args.work_dir is not None:
         cfg.work_dir = args.work_dir
@@ -336,7 +409,15 @@ def evaluate(args):
         args: Parsed command line arguments
     """
     cfg = Config.fromfile(args.config)
-    
+    cfg = _apply_user_overrides(cfg, args)
+
+    # Optional data root override
+    if args.data_root is not None:
+        for split in ['train', 'val', 'test']:
+            if split in cfg.data:
+                cfg.data[split].data_root = args.data_root
+        print(f'Data root set to: {args.data_root}')
+
     # Set multi-process settings
     setup_multi_processes(cfg)
     
@@ -381,7 +462,7 @@ def evaluate(args):
     })
     test_loader_cfg = {
         **loader_cfg,
-        'samples_per_gpu': 1,
+        'samples_per_gpu': args.batch_size or 1,
         'shuffle': False,
         **cfg.data.get('test_dataloader', {})
     }
@@ -464,6 +545,39 @@ def evaluate(args):
     return metric
 
 
+def run_single_gpu(mode='train', **kwargs):
+    """Convenience function to run training or evaluation programmatically.
+
+    This helper mirrors the CLI but can be called from another Python script or
+    a notebook. Only single-GPU execution is supported to keep things simple.
+
+    Examples
+    --------
+    >>> run_single_gpu('train', work_dir='./work_dirs/quick_start')
+    >>> run_single_gpu('eval', checkpoint='./work_dirs/cgrseg/latest.pth')
+    """
+    defaults = dict(mode=mode, config=kwargs.pop('config', DEFAULT_CONFIG))
+    defaults.update({
+        key: kwargs.pop(key, value) for key, value in DEFAULT_HPARAMS.items()
+    })
+
+    if kwargs:
+        unknown_keys = ', '.join(kwargs.keys())
+        raise ValueError(f'Unknown argument(s) for run_single_gpu: {unknown_keys}')
+
+    args = argparse.Namespace(**defaults)
+    if not osp.isfile(args.config):
+        raise FileNotFoundError(f'Config file not found: {args.config}')
+
+    if args.mode == 'eval' and args.checkpoint is None:
+        raise ValueError('checkpoint is required for eval mode')
+
+    if args.mode == 'train':
+        train(args)
+    else:
+        evaluate(args)
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -473,6 +587,14 @@ def main():
     print('=' * 60)
     print(f'Mode: {args.mode}')
     print(f'Config: {args.config}')
+    print('Quick knobs:')
+    print(f'  data_root:   {args.data_root or "(from config)"}')
+    print(f'  lr:          {args.lr or "(from config)"}')
+    print(f'  batch_size:  {args.batch_size or "(from config)"}')
+    print(f'  max_iters:   {args.max_iters or "(from config)"}')
+    print(f'  work_dir:    {args.work_dir or "./work_dirs/<config>"}')
+    if args.mode == "eval":
+        print(f'  checkpoint:  {args.checkpoint}')
     print('=' * 60 + '\n')
     
     if args.mode == 'train':
