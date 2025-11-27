@@ -1,13 +1,11 @@
----
 
-## 📖 Technical Details: Main Contributions
+# 📖 Technical Details: Main Contributions
 
 This section provides an in-depth explanation of the three main contributions of CGRSeg:
 1. **CGRSeg Pipeline**: The overall context-guided spatial feature reconstruction workflow
 2. **RCM (Rectangular Self-Calibration Module)**: Rectangular self-calibration attention + feature fusion
 3. **DPG Head (Dynamic Prototype Guided Head)**: Prototype generation and class embedding for pixel-level refinement
 
----
 
 ### 1. CGRSeg Overall Pipeline
 
