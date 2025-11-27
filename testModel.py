@@ -27,14 +27,10 @@ Example:
 from __future__ import annotations
 
 import argparse
-import copy
 import itertools
 import math
-import os
-import sys
 from dataclasses import dataclass, field
-from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -662,7 +658,11 @@ class RCA(nn.Module):
         self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
         self.pool_w = nn.AdaptiveAvgPool2d((1, None))
         
+        # Ensure ratio is at least 1 to prevent division by zero
+        ratio = max(1, ratio)
         gc = inp // ratio
+        # Ensure gc is at least 1 for valid grouped convolution
+        gc = max(1, gc)
         self.excite = nn.Sequential(
             nn.Conv2d(inp, gc, kernel_size=(1, band_kernel_size), 
                       padding=(0, band_kernel_size // 2), groups=gc),
