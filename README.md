@@ -3,7 +3,7 @@
 Zhenliang Ni, Xinghao Chen, Yingjie Zhai, Yehui Tang, and Yunhe Wang
 
 ## 🔥 Updates
-* **2025/01/01**: Updated for 2025 with PyTorch 2.x and OpenCV 4.x support. Added user-friendly training and evaluation script.
+* **2025/01/01**: Updated for 2025 with PyTorch 2.x and OpenCV 4.x support. Added a user-friendly single-GPU training/evaluation entrypoint.
 * **2024/10/08**: The training code is released and fixed bugs in the issue.
 * **2024/07/01**: The paper of CGRSeg is accepted by ECCV 2024.
 * **2024/05/10**: Codes of CGRSeg are released in [Pytorch](https://github.com/nizhenliang/CGRSeg/) and paper in [[arXiv]](https://arxiv.org/abs/2405.06228).
@@ -31,47 +31,39 @@ Pascal Context
 
 <img width="481" alt="pc" src="https://github.com/nizhenliang/CGRSeg/assets/48742170/d0b3f524-523f-4fc3-a809-691f4617ebb4">
 
-##  2️⃣ Requirements
+##  2️⃣ Quick Start (2025-ready)
 
-CGRSeg is built based on **PyTorch** and **OpenCV**. Below are the installation instructions:
+1. **Create environment** (PyTorch 2.x + OpenCV 4.x):
 
-### For 2025 (Recommended - PyTorch 2.x and OpenCV 4.x)
+   ```shell
+   conda create --name cgrseg python=3.10 -y
+   conda activate cgrseg
 
-```shell
-conda create --name cgrseg python=3.10 -y
-conda activate cgrseg
+   # Install PyTorch 2.x (pick the CUDA build that matches your driver)
+   pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 \
+       --index-url https://download.pytorch.org/whl/cu118
 
-# Install PyTorch 2.x (adjust CUDA version as needed)
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+   # Install OpenCV 4.x and other dependencies
+   pip install opencv-python>=4.8.0 timm>=0.9.0 mmcv>=2.0.0 mmsegmentation>=1.0.0
+   ```
 
-# Install OpenCV 4.x
-pip install opencv-python>=4.8.0
+2. **(Optional) Legacy environment** (for reproducibility with the original release):
 
-# Install other dependencies
-pip install timm>=0.9.0
-pip install mmcv>=2.0.0
-pip install mmsegmentation>=1.0.0
-```
+   ```shell
+   conda create --name ssa python=3.8 -y
+   conda activate ssa
+   pip install torch==1.8.2+cu102 torchvision==0.9.2+cu102 torchaudio==0.8.2
+   pip install timm==0.6.13 mmcv-full==1.6.1 opencv-python==4.1.2.30
+   pip install "mmsegmentation==0.27.0"
+   ```
 
-### Legacy Installation (Original - for compatibility with older environments)
+CGRSeg is built on [mmsegmentation](https://github.com/open-mmlab/mmsegmentation). If you see missing-operator errors, upgrade MMCV/MMDetection/MMEngine to the latest compatible versions for your CUDA toolkit.
 
-```shell
-conda create --name ssa python=3.8 -y
-conda activate ssa
-pip install torch==1.8.2+cu102 torchvision==0.9.2+cu102 torchaudio==0.8.2
-pip install timm==0.6.13
-pip install mmcv-full==1.6.1
-pip install opencv-python==4.1.2.30
-pip install "mmsegmentation==0.27.0"
-```
+3. **IDE-friendly defaults**: open `run_cgrseg.py`, locate the `DEFAULT_HPARAMS` dict near the top, and edit values (learning rate, batch size, data root, etc.). Both the CLI and Python API pick up those defaults automatically so you can hit “Run” in VSCode/PyCharm without extra flags.
 
-CGRSeg is built based on [mmsegmentation](https://github.com/open-mmlab/mmsegmentation), which can be referenced for data preparation.
+## 3️⃣ Dataset Layout (copy & paste ready)
 
-## 3️⃣ Dataset Structure
-
-Before training or evaluation, organize your dataset in the following structure:
-
-### ADE20K Dataset
+Place your datasets under a single `data/` directory so the configs work out of the box. The ADE20K layout expected by `local_configs/cgrseg/cgrseg-t_ade20k_160k.py` is:
 
 ```
 data/
@@ -79,95 +71,87 @@ data/
     └── ADEChallengeData2016/
         ├── images/
         │   ├── training/
-        │   │   ├── ADE_train_00000001.jpg
-        │   │   ├── ADE_train_00000002.jpg
-        │   │   └── ...
         │   └── validation/
-        │       ├── ADE_val_00000001.jpg
-        │       ├── ADE_val_00000002.jpg
-        │       └── ...
         └── annotations/
             ├── training/
-            │   ├── ADE_train_00000001.png
-            │   ├── ADE_train_00000002.png
-            │   └── ...
             └── validation/
-                ├── ADE_val_00000001.png
-                ├── ADE_val_00000002.png
-                └── ...
 ```
 
-### COCO-Stuff-10k Dataset
+Other supported datasets follow a similar pattern:
 
-```
-data/
-└── coco_stuff10k/
-    ├── images/
-    │   ├── train2014/
-    │   │   └── ...
-    │   └── test2014/
-    │       └── ...
-    └── annotations/
-        ├── train2014/
-        │   └── ...
-        └── test2014/
-            └── ...
-```
+- **COCO-Stuff-10k**
 
-### Pascal Context Dataset
+  ```
+  data/
+  └── coco_stuff10k/
+      ├── images/
+      │   ├── train2014/
+      │   └── test2014/
+      └── annotations/
+          ├── train2014/
+          └── test2014/
+  ```
 
-```
-data/
-└── VOCdevkit/
-    └── VOC2010/
-        ├── JPEGImages/
-        │   └── ...
-        └── SegmentationClassContext/
-            └── ...
-```
+- **Pascal Context**
 
-**Note:** You can download these datasets from their official sources:
-- ADE20K: http://sceneparsing.csail.mit.edu/
-- COCO-Stuff: https://github.com/nightrome/cocostuff
-- Pascal Context: https://cs.stanford.edu/~roozbeh/pascal-context/
+  ```
+  data/
+  └── VOCdevkit/
+      └── VOC2010/
+          ├── JPEGImages/
+          └── SegmentationClassContext/
+  ```
 
-## 4️⃣ Training & Testing
+**Tips for newcomers**
+- Download the raw data from the official pages (ADE20K: http://sceneparsing.csail.mit.edu/, COCO-Stuff: https://github.com/nightrome/cocostuff, Pascal Context: https://cs.stanford.edu/~roozbeh/pascal-context/).
+- Unzip directly into `data/` so the folder names match the trees above.
+- If you store data elsewhere, pass `--data-root /path/to/ADEChallengeData2016` to `run_cgrseg.py`.
 
-### Quick Start with Unified Script (Recommended)
+## 4️⃣ Train & Evaluate (single GPU)
 
-We provide a user-friendly script `run_cgrseg.py` that combines training and evaluation in one place with easy hyperparameter adjustment:
+Use the unified helper `run_cgrseg.py` for both training and inference. All hyperparameters are exposed as flags so you can adjust them without editing the config.
 
 ```shell
-# Training (single-GPU)
-python run_cgrseg.py --mode train --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py
+# Train with the default config (ADE20K single-scale)
+python run_cgrseg.py --mode train
 
-# Training with custom hyperparameters
+# Train with custom hyperparameters and a custom data root
 python run_cgrseg.py --mode train \
-    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
-    --lr 0.0001 \
-    --batch-size 4 \
-    --max-iters 80000 \
+    --lr 0.0001 --batch-size 4 --max-iters 80000 \
+    --eval-interval 4000 --data-root ./data/ade/ADEChallengeData2016 \
     --work-dir ./work_dirs/my_experiment
 
-# Evaluation (single-GPU)
+# Evaluate an existing checkpoint (optionally save visualizations)
 python run_cgrseg.py --mode eval \
-    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
-    --checkpoint ./work_dirs/cgrseg-t_ade20k_160k/latest.pth
-
-# Show evaluation results with visualization
-python run_cgrseg.py --mode eval \
-    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
     --checkpoint ./work_dirs/cgrseg-t_ade20k_160k/latest.pth \
     --show-dir ./results
 ```
 
-**Available Hyperparameters:**
-- `--lr`: Learning rate (default: 0.00012)
-- `--batch-size`: Samples per GPU (default: 4)
-- `--max-iters`: Maximum training iterations (default: 160000)
-- `--eval-interval`: Evaluation interval during training (default: 4000)
-- `--seed`: Random seed for reproducibility
-- `--work-dir`: Directory to save logs and checkpoints
+Available knobs for beginners:
+- `--lr`: Learning rate (defaults to config value `0.00012`).
+- `--batch-size`: Samples per GPU (default: `4` for training, `1` for eval).
+- `--max-iters`: Total training iterations (default: `160000`).
+- `--eval-interval`: Validation interval during training (default: `4000`).
+- `--data-root`: Point the dataset somewhere else without editing configs.
+- `--work-dir`: Where to save logs/checkpoints (default: `./work_dirs/<config-name>`).
+
+Prefer Python APIs? Call the built-in helper from any script or notebook:
+
+```python
+from run_cgrseg import run_single_gpu
+
+# Train
+run_single_gpu('train', work_dir='./work_dirs/quick_start')
+
+# Evaluate
+run_single_gpu('eval', checkpoint='./work_dirs/cgrseg-t_ade20k_160k/latest.pth')
+```
+
+**VSCode / PyCharm debugging**
+- Set your run configuration to `run_cgrseg.py`.
+- Adjust quick knobs in `DEFAULT_HPARAMS` (e.g., `batch_size`, `lr`, `data_root`).
+- For evaluation, add `checkpoint` there or pass it in your Run/Debug parameters.
+- Start debugging; the script prints the active settings before training/eval begins.
 
 ### Original Scripts
 
