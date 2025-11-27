@@ -3,6 +3,7 @@
 Zhenliang Ni, Xinghao Chen, Yingjie Zhai, Yehui Tang, and Yunhe Wang
 
 ## 🔥 Updates
+* **2025/01/01**: Updated for 2025 with PyTorch 2.x and OpenCV 4.x support. Added user-friendly training and evaluation script.
 * **2024/10/08**: The training code is released and fixed bugs in the issue.
 * **2024/07/01**: The paper of CGRSeg is accepted by ECCV 2024.
 * **2024/05/10**: Codes of CGRSeg are released in [Pytorch](https://github.com/nizhenliang/CGRSeg/) and paper in [[arXiv]](https://arxiv.org/abs/2405.06228).
@@ -32,25 +33,149 @@ Pascal Context
 
 ##  2️⃣ Requirements
 
-- ```shell
-  conda create --name ssa python=3.8 -y
-  conda activate ssa
-  pip install torch==1.8.2+cu102 torchvision==0.9.2+cu102 torchaudio==0.8.2
-  pip install timm==0.6.13
-  pip install mmcv-full==1.6.1
-  pip install opencv-python==4.1.2.30
-  pip install "mmsegmentation==0.27.0"
-  ```
-  
-  CGRSeg is built based on [mmsegmentation-0.27.0](https://github.com/open-mmlab/mmsegmentation/tree/v0.27.0), which can be referenced for data preparation.
+CGRSeg is built based on **PyTorch** and **OpenCV**. Below are the installation instructions:
 
-## 3️⃣ Training & Testing
+### For 2025 (Recommended - PyTorch 2.x and OpenCV 4.x)
+
+```shell
+conda create --name cgrseg python=3.10 -y
+conda activate cgrseg
+
+# Install PyTorch 2.x (adjust CUDA version as needed)
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+
+# Install OpenCV 4.x
+pip install opencv-python>=4.8.0
+
+# Install other dependencies
+pip install timm>=0.9.0
+pip install mmcv>=2.0.0
+pip install mmsegmentation>=1.0.0
+```
+
+### Legacy Installation (Original - for compatibility with older environments)
+
+```shell
+conda create --name ssa python=3.8 -y
+conda activate ssa
+pip install torch==1.8.2+cu102 torchvision==0.9.2+cu102 torchaudio==0.8.2
+pip install timm==0.6.13
+pip install mmcv-full==1.6.1
+pip install opencv-python==4.1.2.30
+pip install "mmsegmentation==0.27.0"
+```
+
+CGRSeg is built based on [mmsegmentation](https://github.com/open-mmlab/mmsegmentation), which can be referenced for data preparation.
+
+## 3️⃣ Dataset Structure
+
+Before training or evaluation, organize your dataset in the following structure:
+
+### ADE20K Dataset
+
+```
+data/
+└── ade/
+    └── ADEChallengeData2016/
+        ├── images/
+        │   ├── training/
+        │   │   ├── ADE_train_00000001.jpg
+        │   │   ├── ADE_train_00000002.jpg
+        │   │   └── ...
+        │   └── validation/
+        │       ├── ADE_val_00000001.jpg
+        │       ├── ADE_val_00000002.jpg
+        │       └── ...
+        └── annotations/
+            ├── training/
+            │   ├── ADE_train_00000001.png
+            │   ├── ADE_train_00000002.png
+            │   └── ...
+            └── validation/
+                ├── ADE_val_00000001.png
+                ├── ADE_val_00000002.png
+                └── ...
+```
+
+### COCO-Stuff-10k Dataset
+
+```
+data/
+└── coco_stuff10k/
+    ├── images/
+    │   ├── train2014/
+    │   │   └── ...
+    │   └── test2014/
+    │       └── ...
+    └── annotations/
+        ├── train2014/
+        │   └── ...
+        └── test2014/
+            └── ...
+```
+
+### Pascal Context Dataset
+
+```
+data/
+└── VOCdevkit/
+    └── VOC2010/
+        ├── JPEGImages/
+        │   └── ...
+        └── SegmentationClassContext/
+            └── ...
+```
+
+**Note:** You can download these datasets from their official sources:
+- ADE20K: http://sceneparsing.csail.mit.edu/
+- COCO-Stuff: https://github.com/nightrome/cocostuff
+- Pascal Context: https://cs.stanford.edu/~roozbeh/pascal-context/
+
+## 4️⃣ Training & Testing
+
+### Quick Start with Unified Script (Recommended)
+
+We provide a user-friendly script `run_cgrseg.py` that combines training and evaluation in one place with easy hyperparameter adjustment:
+
+```shell
+# Training (single-GPU)
+python run_cgrseg.py --mode train --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py
+
+# Training with custom hyperparameters
+python run_cgrseg.py --mode train \
+    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
+    --lr 0.0001 \
+    --batch-size 4 \
+    --max-iters 80000 \
+    --work-dir ./work_dirs/my_experiment
+
+# Evaluation (single-GPU)
+python run_cgrseg.py --mode eval \
+    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
+    --checkpoint ./work_dirs/cgrseg-t_ade20k_160k/latest.pth
+
+# Show evaluation results with visualization
+python run_cgrseg.py --mode eval \
+    --config local_configs/cgrseg/cgrseg-t_ade20k_160k.py \
+    --checkpoint ./work_dirs/cgrseg-t_ade20k_160k/latest.pth \
+    --show-dir ./results
+```
+
+**Available Hyperparameters:**
+- `--lr`: Learning rate (default: 0.00012)
+- `--batch-size`: Samples per GPU (default: 4)
+- `--max-iters`: Maximum training iterations (default: 160000)
+- `--eval-interval`: Evaluation interval during training (default: 4000)
+- `--seed`: Random seed for reproducibility
+- `--work-dir`: Directory to save logs and checkpoints
+
+### Original Scripts
 
 - Train
   
   ```shell
   # Single-gpu training
-  python train.py local_configs/cgrseg/cgrseg-t_ade20k_160k.py
+  python tools/train.py local_configs/cgrseg/cgrseg-t_ade20k_160k.py
   
   # Multi-gpu (4-gpu) training
   sh tools/dist_train.sh local_configs/cgrseg/cgrseg-t_ade20k_160k.py 4
@@ -60,7 +185,7 @@ Pascal Context
   
   ```shell
   # Single-gpu testing
-  python test.py local_configs/cgrseg/cgrseg-t_ade20k_160k.py ${CHECKPOINT_FILE} --eval mIoU
+  python tools/test.py local_configs/cgrseg/cgrseg-t_ade20k_160k.py ${CHECKPOINT_FILE} --eval mIoU
   
   # Multi-gpu (4-gpu) testing
   sh tools/dist_test.sh local_configs/cgrseg/cgrseg-t_ade20k_160k.py ${CHECKPOINT_FILE} 4 --eval mIoU
