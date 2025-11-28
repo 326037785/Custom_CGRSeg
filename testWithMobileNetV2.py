@@ -10,6 +10,7 @@ except ImportError:
     print("未安装 thop，请运行: pip install thop")
     profile = None
 
+# 依赖 timm 的基础层，如果不想安装 timm，可以手动实现这两个简单的 helper
 from timm.layers import DropPath, trunc_normal_, to_2tuple
 
 # ============================================================================
@@ -18,7 +19,6 @@ from timm.layers import DropPath, trunc_normal_, to_2tuple
 #   F3: 1/16 分辨率，投到 120 通道
 #   F4: 1/32 分辨率，投到 224 通道
 # ============================================================================
-
 class ConvBNReLU(nn.Sequential):
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, groups=1):
         padding = (kernel_size - 1) // 2
@@ -44,13 +44,11 @@ class InvertedResidual(nn.Module):
         self.use_res_connect = (stride == 1 and inp == oup)
 
         layers = []
-        # pw
         if expand_ratio != 1:
             layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1, stride=1))
         else:
             hidden_dim = inp
 
-        # dw
         layers.append(
             ConvBNReLU(
                 hidden_dim,
@@ -60,7 +58,6 @@ class InvertedResidual(nn.Module):
                 groups=hidden_dim,
             )
         )
-        # pw-linear
         layers.extend([
             nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
             nn.BatchNorm2d(oup),
@@ -76,39 +73,32 @@ class InvertedResidual(nn.Module):
 
 class MobileNetV2Backbone(nn.Module):
     """
-    轻量级 MobileNetV2 backbone
-    - 输入: B,3,H,W
-    - 输出: [F2, F3, F4]
-        F2: 1/8,  通道 48
-        F3: 1/16, 通道 120
-        F4: 1/32, 通道 224
-    这里把原始的通道 [32, 96, 160] 用 1x1 conv 投到 [48, 120, 224]，
+    MobileNetV2 轻量 backbone
+    - 输入:  B, 3, H, W
+    - 输出:  [F2, F3, F4]
+        F2: 1/8,  C=32
+        F3: 1/16, C=96
+        F4: 1/32, C=160
     """
-    def __init__(self, out_channels=(48, 120, 224)):
+    def __init__(self):
         super().__init__()
 
-        # ==== Stem: 1/2 ====
+        # Stem: 1/2
         self.stem = ConvBNReLU(3, 32, kernel_size=3, stride=2)
 
-        # MobileNetV2 配置: (t, c, n, s)
-        # 这里只是展开成若干 stage，方便取 F2/F3/F4
-        # 32x -> 16x -> 8x -> 4x 等比例按 stride 下采样
+        # (t, c, n, s) 展开的几个 stage
         self.stage1 = self._make_stage(32, 16, n=1, stride=1, expand_ratio=1)  # 1/2
         self.stage2 = self._make_stage(16, 24, n=2, stride=2, expand_ratio=6)  # 1/4
-        self.stage3 = self._make_stage(24, 32, n=3, stride=2, expand_ratio=6)  # 1/8 -> F2 raw (C=32)
+
+        # F2: 1/8, C=32
+        self.stage3 = self._make_stage(24, 32, n=3, stride=2, expand_ratio=6)  # 1/8
+
+        # F3: 1/16, C=96
         self.stage4 = self._make_stage(32, 64, n=4, stride=2, expand_ratio=6)  # 1/16
-        self.stage5 = self._make_stage(64, 96, n=3, stride=1, expand_ratio=6)  # 1/16 -> F3 raw (C=96)
-        self.stage6 = self._make_stage(96, 160, n=3, stride=2, expand_ratio=6) # 1/32 -> F4 raw (C=160)
-        # stage7 (320 通道) 不参与 RCHead，就不建了 / 或者你想要可以再加
+        self.stage5 = self._make_stage(64, 96, n=3, stride=1, expand_ratio=6)  # 1/16
 
-        # 原始通道
-        c2_raw, c3_raw, c4_raw = 32, 96, 160
-        c2, c3, c4 = out_channels
-
-        # 适配你锁死的维度 [48, 120, 224]
-        self.f2_proj = nn.Conv2d(c2_raw, c2, kernel_size=1, bias=False)
-        self.f3_proj = nn.Conv2d(c3_raw, c3, kernel_size=1, bias=False)
-        self.f4_proj = nn.Conv2d(c4_raw, c4, kernel_size=1, bias=False)
+        # F4: 1/32, C=160
+        self.stage6 = self._make_stage(96, 160, n=3, stride=2, expand_ratio=6) # 1/32
 
         self._init_weights()
 
@@ -131,25 +121,21 @@ class MobileNetV2Backbone(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: B,3,H,W
         x = self.stem(x)      # 1/2
         x = self.stage1(x)    # 1/2
         x = self.stage2(x)    # 1/4
 
         x = self.stage3(x)    # 1/8
-        f2 = self.f2_proj(x)  # (B, 48, H/8, W/8)
+        f2 = x                # C = 32
 
         x = self.stage4(x)    # 1/16
         x = self.stage5(x)    # 1/16
-        f3 = self.f3_proj(x)  # (B, 120, H/16, W/16)
+        f3 = x                # C = 96
 
         x = self.stage6(x)    # 1/32
-        f4 = self.f4_proj(x)  # (B, 224, H/32, W/32)
+        f4 = x                # C = 160
 
         return [f2, f3, f4]
-
-
-
 
 # ============================================================================
 # Part 2: CGRSeg Decode Head (Specific to Tiny config)
@@ -219,96 +205,112 @@ class DPGHead(nn.Module):
 
 class CGRSegHead_Tiny(nn.Module):
     """
-    Fixed config for Tiny:
-    Input Channels: [48, 120, 224]
-    Embedding Channel: 128
+    Tiny 版解码头
+    - 默认配合 MobileNetV2:
+        F2: C=32, 1/8
+        F3: C=96, 1/16
+        F4: C=160, 1/32
+    - 统一投到 embedding 通道: 128
     """
     def __init__(self, num_classes=150):
         super().__init__()
-        in_channels = [48, 120, 224]
+        # 用 MobileNetV2 原生特征维度
+        in_channels = [32, 96, 160]
         channels = 128
         
-        # Projections
         self.linear_fuse = nn.Sequential(
             nn.Conv2d(channels, channels, 1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels), nn.ReLU()
+            nn.BatchNorm2d(channels),
+            nn.ReLU()
         )
-        
-        # Transformer Stage (Next Layer)
-        # For Tiny: next_repeat=5, mr=2, neck_size=11
+
+        # Next Layer Transformer (RCM 堆叠)，输入通道 = C2+C3+C4
         self.trans_blocks = nn.ModuleList([
             RCM(sum(in_channels), dw_size=11) for _ in range(5)
         ])
-        
-        # Stages
+
         self.SIM = nn.ModuleList()
         self.meta = nn.ModuleList()
         self.conv = nn.ModuleList()
         
         for i in range(len(in_channels)):
-            # Fuse Block Multi (SIM)
+            # SIM: 两个 1x1 把 local/global 都投到统一 embedding 维度
             self.SIM.append(nn.Sequential(
-                nn.Conv2d(in_channels[i], channels, 1, bias=False), nn.BatchNorm2d(channels), # Fuse1
-                nn.Conv2d(in_channels[i], channels, 1, bias=False), nn.BatchNorm2d(channels), # Fuse2
+                nn.Conv2d(in_channels[i], channels, 1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.Conv2d(in_channels[i], channels, 1, bias=False),
+                nn.BatchNorm2d(channels),
             ))
-            # Meta (RCM)
+            # Meta: 每个尺度自己的 RCM
             self.meta.append(RCM(in_channels[i], dw_size=11))
             
             if i < len(in_channels) - 1:
+                # 用于把上一级 embedding 映射回该层的原生 in_channels
                 self.conv.append(nn.Conv2d(channels, in_channels[i], 1))
 
         self.lgc = DPGHead(channels)
-        self.cls_seg = nn.Sequential(nn.Dropout2d(0.1), nn.Conv2d(channels, num_classes, 1))
+        self.cls_seg = nn.Sequential(
+            nn.Dropout2d(0.1),
+            nn.Conv2d(channels, num_classes, 1)
+        )
 
     def forward(self, features):
-        # features: [C48, C120, C224] (Scales 1/8, 1/16, 1/32)
+        # features: [C32, C96, C160] (Scales 1/8, 1/16, 1/32)
         
-        # 1. PPA (Pyramid Pool Aggregation)
+        # 1. PPA
         H, W = (features[-1].shape[2] - 1) // 2 + 1, (features[-1].shape[3] - 1) // 2 + 1
-        ppa_in = torch.cat([F.adaptive_avg_pool2d(f, (H, W)) for f in features], dim=1)
+        ppa_in = torch.cat(
+            [F.adaptive_avg_pool2d(f, (H, W)) for f in features],
+            dim=1
+        )  # 通道数 = 32+96+160 = 288
         
-        # 2. Next Layer Transformer
+        # 2. RCM 堆叠
         out = ppa_in
         for block in self.trans_blocks:
             out = block(out)
         
-        # 3. Split
-        f_cat = out.split([48, 120, 224], dim=1) # split by in_channels
+        # 3. 按 in_channels 拆回三个尺度
+        f_cat = out.split([32, 96, 160], dim=1)
         
-        # 4. Hierarchical Fusion
+        # 4. 自顶向下层级融合
         results = []
-        for i in range(2, -1, -1): # [2, 1, 0]
+        for i in range(2, -1, -1):  # 2,1,0
             if i == 2:
                 local_tokens = features[i]
             else:
-                # Upsample previous result and add
-                upsampled = F.interpolate(results[-1], size=features[i].shape[2:], mode='bilinear', align_corners=False)
+                upsampled = F.interpolate(
+                    results[-1],
+                    size=features[i].shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
                 local_tokens = features[i] + self.conv[i](upsampled)
             
             global_sem = f_cat[i]
             local_tokens = self.meta[i](local_tokens)
-            
-            # SIM Block Logic (Inline for clarity)
+
             sim_block = self.SIM[i]
-            inp = sim_block[0:2](local_tokens) # fuse1
-            sig_act = sim_block[2:4](global_sem) # fuse2
-            # H-Sigmoid
-            sig_act = F.interpolate(F.relu6(sig_act + 3) / 6, size=inp.shape[2:], mode='bilinear', align_corners=False)
+            inp = sim_block[0:2](local_tokens)
+            sig_act = sim_block[2:4](global_sem)
+            sig_act = F.interpolate(
+                F.relu6(sig_act + 3) / 6,
+                size=inp.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
             results.append(inp * sig_act)
             
-        x = results[-1] # The finest scale result
-        
-        # 5. Final Head
+        x = results[-1]
+
+        # 5. DPG + 分类头
         _c = self.linear_fuse(x)
         prev_pred = self.cls_seg(_c)
-        
-        # Spatial Gather
+
         B, N, H, W = prev_pred.shape
         probs = F.softmax(prev_pred.view(B, N, -1), dim=2)
         feats = x.view(B, x.shape[1], -1).permute(0, 2, 1)
-        context = torch.matmul(probs, feats).permute(0, 2, 1).unsqueeze(3) # OCR Context
-        
-        # DPG Head
+        context = torch.matmul(probs, feats).permute(0, 2, 1).unsqueeze(3)
+
         final_out = self.lgc(x, context) + x
         return self.cls_seg(final_out)
 
@@ -316,10 +318,10 @@ class CGRSegHead_Tiny(nn.Module):
 # Part 3: Full Standalone Model
 # ============================================================================
 
-class CGRSeg_Tiny_Standalone(nn.Module):
-    def __init__(self, num_classes=150, input_size=512):
+class SGTinyNet(nn.Module):
+    def __init__(self, in_channels = 3, num_classes=150, input_size=512):
         super().__init__()
-        self.backbone = MobileNetV2Backbone(out_channels=(48, 120, 224))
+        self.backbone = MobileNetV2Backbone()
         self.decode_head = CGRSegHead_Tiny(num_classes=num_classes)
         
     def forward(self, x):
@@ -343,7 +345,7 @@ if __name__ == "__main__":
     # 1. initualize model
     input_size = 512
     num_classes = 2
-    model = CGRSeg_Tiny_Standalone(num_classes=num_classes, input_size=input_size)
+    model = SGTinyNet(num_classes=num_classes, input_size=input_size)
     model.eval()
 
     # 2. create dummy input
