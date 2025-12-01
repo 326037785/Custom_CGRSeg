@@ -446,6 +446,192 @@ class STDCBackbone(nn.Module):
         F4 = x4
 
         return [F2, F3, F4]
+    
+# ============================================================================
+# EfficientNet
+# ============================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SqueezeExcite(nn.Module):
+    """
+    EfficientNet 风格的 SE 模块:
+      - 全局池化 CxHxW -> Cx1x1
+      - 两层全连接 (用 1x1 conv 实现)
+      - Sigmoid 得到通道权重
+    """
+    def __init__(self, in_ch: int, se_ratio: float = 0.25):
+        super().__init__()
+        hidden = max(1, int(in_ch * se_ratio))
+        self.fc1 = nn.Conv2d(in_ch, hidden, kernel_size=1)
+        self.fc2 = nn.Conv2d(hidden, in_ch, kernel_size=1)
+
+    def forward(self, x):
+        # 全局平均池化
+        s = F.adaptive_avg_pool2d(x, 1)
+        s = F.silu(self.fc1(s), inplace=True)
+        s = torch.sigmoid(self.fc2(s))
+        return x * s
+        
+
+class MBConv(nn.Module):
+    """
+    EfficientNet 风格的 MBConv block:
+      - expand (1x1)
+      - depthwise conv (3x3 or 5x5)
+      - SE
+      - projection (1x1)
+      - 可选残差 + Stochastic Depth (这里只留残差)
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        expand_ratio: int = 6,
+        se_ratio: float = 0.25,
+    ):
+        super().__init__()
+        assert stride in [1, 2]
+        self.stride = stride
+        self.use_res = (stride == 1 and in_ch == out_ch)
+        mid = in_ch * expand_ratio
+
+        layers = []
+
+        # 1) Expand
+        if expand_ratio != 1:
+            layers.append(nn.Conv2d(in_ch, mid, kernel_size=1, bias=False))
+            layers.append(nn.BatchNorm2d(mid))
+            layers.append(nn.SiLU(inplace=True))
+        else:
+            mid = in_ch
+
+        # 2) Depthwise
+        layers.append(
+            nn.Conv2d(
+                mid,
+                mid,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=kernel_size // 2,
+                groups=mid,
+                bias=False,
+            )
+        )
+        layers.append(nn.BatchNorm2d(mid))
+        layers.append(nn.SiLU(inplace=True))
+
+        self.pre_se = nn.Sequential(*layers)
+
+        # 3) Squeeze-and-Excitation
+        self.se = SqueezeExcite(mid, se_ratio=se_ratio)
+
+        # 4) Projection
+        self.project = nn.Sequential(
+            nn.Conv2d(mid, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+
+    def forward(self, x):
+        out = self.pre_se(x)
+        out = self.se(out)
+        out = self.project(out)
+        if self.use_res:
+            out = out + x
+        return out
+
+class EfficientNetBackbone(nn.Module):
+    """
+    EfficientNet 风格 Tiny Backbone：
+      输出三个尺度:
+        F2: 1/8   分辨率
+        F3: 1/16  分辨率
+        F4: 1/32  分辨率
+      用于接你现有的 CGRSegHead_Tiny。
+    """
+    def __init__(self, in_channels: int = 3, width_mult: float = 1.0):
+        super().__init__()
+
+        def ch(c):
+            # 通道缩放，至少 8
+            return max(8, int(c * width_mult))
+
+        # 这一套配置是 B0 的一个缩小版
+        c1 = ch(24)   # stem & stage1
+        c2 = ch(48)   # 1/4
+        c3 = ch(64)   # 1/8  -> F2
+        c4 = ch(96)   # 1/16 -> F3
+        c5 = ch(128)  # 1/32 -> F4
+        # Stem 1/2
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, c1, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+        )  # -> 1/2
+
+        # Stage1: 1/2
+        self.stage1 = nn.Sequential(
+            MBConv(c1, c1, kernel_size=3, stride=1, expand_ratio=1, se_ratio=0.25),
+        )
+
+        # Stage2: 1/4
+        self.stage2 = nn.Sequential(
+            MBConv(c1, c2, kernel_size=3, stride=2, expand_ratio=6, se_ratio=0.25),
+            MBConv(c2, c2, kernel_size=3, stride=1, expand_ratio=6, se_ratio=0.25),
+        )
+
+        # Stage3: 1/8  -> F2
+        self.stage3 = nn.Sequential(
+            MBConv(c2, c3, kernel_size=5, stride=2, expand_ratio=6, se_ratio=0.25),
+            MBConv(c3, c3, kernel_size=5, stride=1, expand_ratio=6, se_ratio=0.25),
+        )
+
+        # Stage4: 1/16 -> F3
+        self.stage4 = nn.Sequential(
+            MBConv(c3, c4, kernel_size=3, stride=2, expand_ratio=6, se_ratio=0.25),
+            MBConv(c4, c4, kernel_size=3, stride=1, expand_ratio=6, se_ratio=0.25),
+            MBConv(c4, c4, kernel_size=3, stride=1, expand_ratio=6, se_ratio=0.25),
+        )
+
+        # Stage5: 1/32 -> F4
+        self.stage5 = nn.Sequential(
+            MBConv(c4, c5, kernel_size=5, stride=2, expand_ratio=6, se_ratio=0.25),
+            MBConv(c5, c5, kernel_size=5, stride=1, expand_ratio=6, se_ratio=0.25),
+        )
+
+        self.F2 = c3
+        self.F3 = c4
+        self.F4 = c5
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.stem(x)      # 1/2
+        x = self.stage1(x)    # 1/2
+        x = self.stage2(x)    # 1/4
+
+        x2 = self.stage3(x)   # 1/8
+        x3 = self.stage4(x2)  # 1/16
+        x4 = self.stage5(x3)  # 1/32
+
+        # 对齐 decode head 的接口
+        return [x2, x3, x4]
+
 
 
 # ============================================================================
@@ -669,7 +855,8 @@ class SGTinyNet(nn.Module):
         super().__init__()
         #self.backbone = MobileNetV2Backbone()
         #self.backbone = UNetBackbone(in_channels=in_channels)
-        self.backbone = STDCBackbone(in_channels=in_channels, base_ch=32, num_splits=4)
+        #self.backbone = STDCBackbone(in_channels=in_channels, base_ch=32, num_splits=4)
+        self.backbone = EfficientNetBackbone(in_channels=in_channels)
         
         in_channels = [self.backbone.F2, self.backbone.F3, self.backbone.F4]
 
