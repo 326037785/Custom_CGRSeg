@@ -100,6 +100,10 @@ class MobileNetV2Backbone(nn.Module):
         # F4: 1/32, C=160
         self.stage6 = self._make_stage(96, 160, n=3, stride=2, expand_ratio=6) # 1/32
 
+        self.F2 = 32
+        self.F3 = 96
+        self.F4 = 160
+
         self._init_weights()
 
     def _make_stage(self, inp, oup, n, stride, expand_ratio):
@@ -212,10 +216,10 @@ class CGRSegHead_Tiny(nn.Module):
         F4: C=160, 1/32
     - 统一投到 embedding 通道: 128
     """
-    def __init__(self, num_classes=150):
+    def __init__(self, num_classes=150, in_channels=[32, 96, 160]):
         super().__init__()
         # 用 MobileNetV2 原生特征维度
-        in_channels = [32, 96, 160]
+        self.in_channels = in_channels
         channels = 128
         
         self.linear_fuse = nn.Sequential(
@@ -226,7 +230,7 @@ class CGRSegHead_Tiny(nn.Module):
 
         # Next Layer Transformer (RCM 堆叠)，输入通道 = C2+C3+C4
         self.trans_blocks = nn.ModuleList([
-            RCM(sum(in_channels), dw_size=11) for _ in range(5)
+            RCM(sum(self.in_channels), dw_size=11) for _ in range(5)
         ])
 
         self.SIM = nn.ModuleList()
@@ -322,7 +326,10 @@ class SGTinyNet(nn.Module):
     def __init__(self, in_channels = 3, num_classes=150, input_size=512):
         super().__init__()
         self.backbone = MobileNetV2Backbone()
-        self.decode_head = CGRSegHead_Tiny(num_classes=num_classes)
+        
+        in_channels = [self.backbone.F2, self.backbone.F3, self.backbone.F4]
+
+        self.decode_head = CGRSegHead_Tiny(num_classes=num_classes, in_channels=in_channels)
         
     def forward(self, x):
         # 1. Backbone
