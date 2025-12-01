@@ -151,18 +151,18 @@ class RCA(nn.Module):
     
     核心思想 (参见 paper/readme_zh.md 第 2 节):
     1. 十字形池化 (Cross-shaped Pooling):
-       - pool_h: 沿宽度方向做全局平均池化，保留高度信息 → X_h ∈ R^{B×C×H×1}
-       - pool_w: 沿高度方向做全局平均池化，保留宽度信息 → X_w ∈ R^{B×C×1×W}
-       - 两者相加 (广播) 得到十字形上下文特征
+       - pool_h: 沿宽度方向做全局平均池化，保留高度信息 → X_h ∈ R^{B×C×H×1}。
+       - pool_w: 沿高度方向做全局平均池化，保留宽度信息 → X_w ∈ R^{B×C×1×W}。
+       - 两者相加 (广播) 得到十字形上下文特征。
     
     2. 带状卷积激励 (Band Convolution Excitation):
-       - 先用 1×k_w 水平带状卷积捕获水平结构 (如道路连续性)
-       - 再用 k_h×1 垂直带状卷积捕获垂直结构 (如路灯、交通标志)
-       - 最后通过 Sigmoid 生成注意力权重
+       - 先用 1×k_w 水平带状卷积捕获水平结构 (如道路连续性)。
+       - 再用 k_h×1 垂直带状卷积捕获垂直结构 (如路灯、交通标志)。
+       - 最后通过 Sigmoid 生成注意力权重。
     
     3. 局部特征调制:
-       - dwconv_hw: 方形深度卷积提取局部特征 X_local
-       - 最终输出 = 注意力权重 A ⊙ 局部特征 X_local
+       - dwconv_hw: 方形深度卷积提取局部特征 X_local。
+       - 最终输出 = 注意力权重 A ⊙ 局部特征 X_local。
     
     公式:
         X_cross = X_h + X_w  (十字形特征聚合)
@@ -224,8 +224,7 @@ class RCM(nn.Module):
         # Token Mixer: RCA 进行空间特征混合
         self.token_mixer = RCA(dim, band_kernel_size=dw_size, square_kernel_size=3, ratio=1)
         self.norm = nn.BatchNorm2d(dim)
-        # Channel Mixer: MLP (扩展比固定为 2)
-        # MLP Ratio is fixed to 2 for Tiny
+        # Channel Mixer: MLP，扩展比固定为 2 (dim → dim*2 → dim)
         self.mlp = nn.Sequential(
             nn.Conv2d(dim, dim*2, 1), nn.Identity(), nn.GELU(), nn.Dropout(0), nn.Conv2d(dim*2, dim, 1)
         )
@@ -359,13 +358,14 @@ class CGRSegHead_Tiny(nn.Module):
         self.conv = nn.ModuleList()  # 上采样后的通道映射
         
         for i in range(len(in_channels)):
-            # SIM (Sigmoid-gated Fusion): 两个 1x1 卷积把 local/global 都投到统一 embedding 维度
-            # 前两层处理 local tokens，后两层处理 global semantics
+            # SIM (Sigmoid-gated Fusion): 4 层序列，分为两对 Conv+BN:
+            #   - [0:2] (Conv+BN): 用于 local tokens 投影
+            #   - [2:4] (Conv+BN): 用于 global semantics 投影
             self.SIM.append(nn.Sequential(
-                nn.Conv2d(in_channels[i], channels, 1, bias=False),  # local projection
-                nn.BatchNorm2d(channels),
-                nn.Conv2d(in_channels[i], channels, 1, bias=False),  # global projection
-                nn.BatchNorm2d(channels),
+                nn.Conv2d(in_channels[i], channels, 1, bias=False),  # [0] local projection conv
+                nn.BatchNorm2d(channels),                            # [1] local projection bn
+                nn.Conv2d(in_channels[i], channels, 1, bias=False),  # [2] global projection conv
+                nn.BatchNorm2d(channels),                            # [3] global projection bn
             ))
             # Meta: 每个尺度自己的 RCM，用于局部特征增强
             self.meta.append(RCM(in_channels[i], dw_size=11))
@@ -448,14 +448,15 @@ class CGRSegHead_Tiny(nn.Module):
 
             # ---------- SIM (Sigmoid-gated Fusion) - Sigmoid 门控融合 ----------
             # 将局部特征和全局语义通过 Sigmoid 门控机制融合
-            # 公式: output = local_proj ⊙ sigmoid(global_proj + 3) / 6
+            # 使用 HardSigmoid 近似: HardSigmoid(x) = ReLU6(x + 3) / 6
+            # 公式: output = local_proj ⊙ HardSigmoid(global_proj)
             # 参见 paper/readme_zh.md 第 1 节: "SIM_fuse(local_tokens, global_features[i])"
             sim_block = self.SIM[i]
-            inp = sim_block[0:2](local_tokens)    # 局部特征投影到 embedding 维度
-            sig_act = sim_block[2:4](global_sem)  # 全局语义投影到 embedding 维度
-            # 使用 HardSigmoid 近似: (x + 3) / 6，并上采样到局部特征分辨率
+            inp = sim_block[0:2](local_tokens)    # 局部特征投影到 embedding 维度 (Conv+BN)
+            sig_act = sim_block[2:4](global_sem)  # 全局语义投影到 embedding 维度 (Conv+BN)
+            # HardSigmoid 激活并上采样到局部特征分辨率
             sig_act = F.interpolate(
-                F.relu6(sig_act + 3) / 6,  # HardSigmoid 激活
+                F.relu6(sig_act + 3) / 6,  # HardSigmoid(x) = clamp(x+3, 0, 6) / 6
                 size=inp.shape[2:],
                 mode='bilinear',
                 align_corners=False
@@ -477,7 +478,7 @@ class CGRSegHead_Tiny(nn.Module):
 
         # ---------- Step 5a: 原型提取 (Spatial Gather) ----------
         # 像素空间 → 类别空间: 使用初始预测加权聚合像素特征，得到类别原型
-        # 公式: context_k = Σᵢ (softmax(P)_{k,i} · X_i)
+        # 对每个类别 k: context[k] = sum_i(softmax(P)[k,i] * X[i])
         # 参见 paper/readme.md 第 3.2 节: "Z = P̂ · Y^T"
         B, N, H, W = prev_pred.shape
         probs = F.softmax(prev_pred.view(B, N, -1), dim=2)  # [B, K, HW]，沿空间维度归一化
