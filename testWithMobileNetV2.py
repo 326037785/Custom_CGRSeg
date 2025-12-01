@@ -146,35 +146,53 @@ class MobileNetV2Backbone(nn.Module):
 # ============================================================================
 
 class RCA(nn.Module):
-    """Region-wise Channel Attention"""
+    """
+    Region-wise Channel Attention (论文中的矩形自校准注意力)
+    核心功能：通过十字形池化和带状卷积捕获矩形上下文。
+    """
     def __init__(self, inp, kernel_size=1, ratio=1, band_kernel_size=11, square_kernel_size=2):
         super().__init__()
+        # Step 1: Local Feature Extraction (局部特征提取)
+        # 使用方形卷积提取局部细节
         self.dwconv_hw = nn.Conv2d(inp, inp, square_kernel_size, padding=square_kernel_size // 2, groups=inp)
-        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
-        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        # Step 2: Cross-shaped Pooling (十字形池化)
+        # 分别沿水平和垂直方向进行全局池化，保留长距离依赖
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1)) # 保持 H，压缩 W -> [B, C, H, 1]
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None)) # 保持 W，压缩 H -> [B, C, 1, W]
         
         gc = max(1, inp // ratio)
+        
+        # Step 4: Band Convolution Excitation (带状卷积激励)
+        # 使用非对称卷积 (1xK, Kx1) 模拟矩形感受野，生成注意力权重
         self.excite = nn.Sequential(
             nn.Conv2d(inp, gc, (1, band_kernel_size), padding=(0, band_kernel_size // 2), groups=gc),
             nn.BatchNorm2d(gc), nn.ReLU(inplace=True),
             nn.Conv2d(gc, inp, (band_kernel_size, 1), padding=(band_kernel_size // 2, 0), groups=gc),
-            nn.Sigmoid()
+            nn.Sigmoid() # 生成 0~1 的注意力图
         )
 
     def forward(self, x):
-        loc = self.dwconv_hw(x)
-        x_h = self.pool_h(x)
-        x_w = self.pool_w(x)
-        att = self.excite(x_h + x_w)
+        loc = self.dwconv_hw(x)       # 局部特征
+        x_h = self.pool_h(x)          # 水平上下文
+        x_w = self.pool_w(x)          # 垂直上下文
+        
+        # Step 3: Cross-shaped Aggregation & Step 5: Attention
+        # 广播相加后通过 excite 生成注意力，最后调制局部特征
+        att = self.excite(x_h + x_w)  
         return att * loc
 
 class RCM(nn.Module):
-    """Region-wise Context Module"""
+    """
+    Region-wise Context Module (RCM 模块)
+    包含 RCA 注意力和 MLP，用于空间特征重建。
+    """
     def __init__(self, dim, dw_size=11):
         super().__init__()
+        # 使用 RCA 进行 token mixing
         self.token_mixer = RCA(dim, band_kernel_size=dw_size, square_kernel_size=3, ratio=1)
         self.norm = nn.BatchNorm2d(dim)
-        # MLP Ratio is fixed to 2 for Tiny
+        # MLP 用于 channel mixing
         self.mlp = nn.Sequential(
             nn.Conv2d(dim, dim*2, 1), nn.Identity(), nn.GELU(), nn.Dropout(0), nn.Conv2d(dim*2, dim, 1)
         )
@@ -187,24 +205,31 @@ class RCM(nn.Module):
         return shortcut + x.mul(self.gamma.view(1, -1, 1, 1))
 
 class DPGHead(nn.Module):
-    """Dynamic Point-wise Gating Head"""
+    """
+    Dynamic Prototype Guided Head (DPG Head)
+    功能：Stage A (Global Context Pooling) + Stage B (Class -> Pixel Modulation)
+    """
     def __init__(self, channels):
         super().__init__()
         self.conv_mask = nn.Conv2d(channels, 1, 1)
         self.softmax = nn.Softmax(dim=2)
+        
+        # Channel Modulation MLP (用于生成门控权重)
         self.channel_mul_conv = nn.Sequential(
             nn.Conv2d(channels, channels, 1), nn.LayerNorm([channels, 1, 1]),
             nn.ReLU(inplace=True), nn.Conv2d(channels, channels, 1)
         )
 
     def forward(self, x, y):
-        # Spatial Pool (Att)
+        # Step A: Attention-based Global Context Pooling
+        # 将输入的类别原型 y (或特征) 聚合成全局上下文向量
         B, C, H, W = y.shape
         input_x = y.view(B, C, H * W).unsqueeze(1)
-        context_mask = self.softmax(self.conv_mask(y).view(B, 1, H * W)).unsqueeze(3)
-        context = torch.matmul(input_x, context_mask).view(B, C, 1, 1)
+        context_mask = self.softmax(self.conv_mask(y).view(B, 1, H * W)).unsqueeze(3) # 空间注意力
+        context = torch.matmul(input_x, context_mask).view(B, C, 1, 1) # 加权聚合 -> [B, C, 1, 1]
         
-        # Channel Mul Fusion
+        # Step B: Channel Gating (Channel Multiplication)
+        # 利用全局上下文对输入特征 x 进行通道级调制
         return x * torch.sigmoid(self.channel_mul_conv(context))
 
 class CGRSegHead_Tiny(nn.Module):
@@ -228,7 +253,7 @@ class CGRSegHead_Tiny(nn.Module):
             nn.ReLU()
         )
 
-        # Next Layer Transformer (RCM 堆叠)，输入通道 = C2+C3+C4
+        # Global Context Modeling: RCM 堆叠，处理 PPA 聚合后的特征
         self.trans_blocks = nn.ModuleList([
             RCM(sum(self.in_channels), dw_size=11) for _ in range(5)
         ])
@@ -238,14 +263,14 @@ class CGRSegHead_Tiny(nn.Module):
         self.conv = nn.ModuleList()
         
         for i in range(len(in_channels)):
-            # SIM: 两个 1x1 把 local/global 都投到统一 embedding 维度
+            # SIM (Sigmoid-gated Fusion): 门控融合模块
             self.SIM.append(nn.Sequential(
                 nn.Conv2d(in_channels[i], channels, 1, bias=False),
                 nn.BatchNorm2d(channels),
                 nn.Conv2d(in_channels[i], channels, 1, bias=False),
                 nn.BatchNorm2d(channels),
             ))
-            # Meta: 每个尺度自己的 RCM
+            # Meta: 每个尺度自己的 RCM，用于 refine local tokens
             self.meta.append(RCM(in_channels[i], dw_size=11))
             
             if i < len(in_channels) - 1:
@@ -261,27 +286,30 @@ class CGRSegHead_Tiny(nn.Module):
     def forward(self, features):
         # features: [C32, C96, C160] (Scales 1/8, 1/16, 1/32)
         
-        # 1. PPA
+        # 1. PPA (Pyramid Pooling Aggregation)
+        # 将不同尺度的特征下采样到最小分辨率并拼接
         H, W = (features[-1].shape[2] - 1) // 2 + 1, (features[-1].shape[3] - 1) // 2 + 1
         ppa_in = torch.cat(
             [F.adaptive_avg_pool2d(f, (H, W)) for f in features],
             dim=1
         )  # 通道数 = 32+96+160 = 288
         
-        # 2. RCM 堆叠
+        # 2. Global Context Modeling (RCM 堆叠)
+        # 在低分辨率下利用堆叠的 RCM 提取强全局语义
         out = ppa_in
         for block in self.trans_blocks:
             out = block(out)
         
-        # 3. 按 in_channels 拆回三个尺度
+        # 3. Split: 将全局特征拆回对应通道
         f_cat = out.split([32, 96, 160], dim=1)
         
-        # 4. 自顶向下层级融合
+        # 4. Top-Down Hierarchical Fusion (自顶向下层级融合)
         results = []
-        for i in range(2, -1, -1):  # 2,1,0
+        for i in range(2, -1, -1):  # 2,1,0 (从最深层/最粗糙层开始)
             if i == 2:
                 local_tokens = features[i]
             else:
+                # 上采样上一级结果并与当前级特征融合
                 upsampled = F.interpolate(
                     results[-1],
                     size=features[i].shape[2:],
@@ -290,9 +318,11 @@ class CGRSegHead_Tiny(nn.Module):
                 )
                 local_tokens = features[i] + self.conv[i](upsampled)
             
+            # 当前尺度的 RCM Refinement
             global_sem = f_cat[i]
             local_tokens = self.meta[i](local_tokens)
 
+            # SIM Fuse: 使用 Sigmoid 门控机制融合 Local 和 Global 特征
             sim_block = self.SIM[i]
             inp = sim_block[0:2](local_tokens)
             sig_act = sim_block[2:4](global_sem)
@@ -304,18 +334,23 @@ class CGRSegHead_Tiny(nn.Module):
             )
             results.append(inp * sig_act)
             
-        x = results[-1]
+        x = results[-1] # 最精细层特征
 
-        # 5. DPG + 分类头
+        # 5. DPG Head: Prototype Guided Refinement
         _c = self.linear_fuse(x)
-        prev_pred = self.cls_seg(_c)
+        prev_pred = self.cls_seg(_c) # Initial Prediction
 
+        # Step 5.1: Prototype Extraction (Pixel -> Class)
+        # 使用初始预测将像素特征聚合为类别原型
         B, N, H, W = prev_pred.shape
         probs = F.softmax(prev_pred.view(B, N, -1), dim=2)
         feats = x.view(B, x.shape[1], -1).permute(0, 2, 1)
-        context = torch.matmul(probs, feats).permute(0, 2, 1).unsqueeze(3)
+        context = torch.matmul(probs, feats).permute(0, 2, 1).unsqueeze(3) # [B, C, K, 1]
 
+        # Step 5.2: Dynamic Guidance (Class -> Pixel)
+        # DPG Head 内部再次汇聚原型并对 x 进行调制
         final_out = self.lgc(x, context) + x
+        
         return self.cls_seg(final_out)
 
 # ============================================================================
