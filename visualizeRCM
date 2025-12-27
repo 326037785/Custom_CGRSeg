@@ -1,0 +1,461 @@
+import os
+import cv2
+import numpy as np
+import scipy.ndimage
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+globalH = 256
+globalW = 256
+global_dim = 256
+
+
+def make_fake_data(num: int = 8, height: int = 64, width: int = 64):
+    """
+    生成 (N, 1, H, W) 的图像和 (N, H, W) 的二值 mask
+    raw data 通过腐蚀/膨胀 + blur + 噪声，不再是完美方块，
+    方便观察条带卷积对"矩形注意力"的修饰效果。
+    """
+    datas = []
+    targets = []
+
+    for _ in range(num):
+        image = np.zeros((height, width), dtype=np.float32)
+        mask = np.zeros((height, width), dtype=np.int64)
+
+        rect_num = np.random.randint(1, 4)  # 1~3 个矩形
+        for rect_idx in range(rect_num):
+            rect_h = np.random.randint(8, height // 3)
+            rect_w = np.random.randint(8, width // 3)
+            y = np.random.randint(0, height - rect_h)
+            x = np.random.randint(0, width - rect_w)
+
+            image[y:y + rect_h, x:x + rect_w] = 1.0
+            mask[y:y + rect_h, x:x + rect_w] = 1  # 最终就做 2 类：背景 + 前景
+
+        # 噪声
+        noise = np.random.normal(0, 0.1, (height, width)).astype(np.float32)
+        image = image + noise
+
+        # 形态学操作：让边缘更 irregular
+        if np.random.random() > 0.5:
+            image = scipy.ndimage.binary_erosion(image > 0.5).astype(np.float32)
+        else:
+            image = scipy.ndimage.binary_dilation(image > 0.5).astype(np.float32)
+
+        # blur 一下
+        image = scipy.ndimage.gaussian_filter(image, sigma=1.0).astype(np.float32)
+
+        # 再加一点噪声
+        image = image + np.random.normal(0, 0.05, (height, width)).astype(np.float32)
+
+        image = np.clip(image, 0, 1).astype(np.float32)
+
+        # 最终 mask：二值
+        mask = (image > 0.3).astype(np.int64)
+
+        datas.append(torch.from_numpy(image).unsqueeze(0))  # (1,H,W)
+        targets.append(torch.from_numpy(mask))              # (H,W)
+
+    datas = torch.stack(datas, dim=0)      # (N,1,H,W)
+    targets = torch.stack(targets, dim=0)  # (N,H,W)
+    return datas.float(), targets.long()
+
+
+class FakeRectDataset(Dataset):
+    def __init__(self, num: int = 8, height: int = 64, width: int = 64):
+        super().__init__()
+        self.data, self.target = make_fake_data(num, height, width)
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.target[idx]
+
+
+class FakeDataLoader(DataLoader):
+    def __init__(self, num: int = 8, height: int = 64, width: int = 64,
+                 batch_size: int = 4, shuffle: bool = True):
+        dataset = FakeRectDataset(num, height, width)
+        super(FakeDataLoader, self).__init__(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=shuffle)
+
+
+class RCA(nn.Module):
+    """Region-wise Channel Attention (原作者设计)"""
+    def __init__(self, inp, ratio=1,
+                 band_kernel_size=11, square_kernel_size=3):
+        super().__init__()
+        # 局部 depthwise 卷积 (提取 local feature)
+        self.dwconv_hw = nn.Conv2d(
+            inp, inp,
+            kernel_size=square_kernel_size,
+            padding=square_kernel_size // 2,
+            groups=inp
+        )
+        # 条带池化：沿 W 平均得到竖条；沿 H 平均得到横条
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))   # (B,C,H,1)
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))   # (B,C,1,W)
+
+        gc = max(1, inp // ratio)
+        
+        # 拆解 excite 步骤以便可视化中间结果
+        # 1. 水平方向条带卷积 (1 × k)
+        self.conv_h = nn.Conv2d(inp, gc, (1, band_kernel_size),
+                                padding=(0, band_kernel_size // 2),
+                                groups=gc)
+        self.bn = nn.BatchNorm2d(gc)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 2. 垂直方向条带卷积 (k × 1)
+        self.conv_w = nn.Conv2d(gc, inp, (band_kernel_size, 1),
+                                padding=(band_kernel_size // 2, 0),
+                                groups=gc)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # local 分支
+        loc = self.dwconv_hw(x)
+
+        # H / W 条带上下文
+        x_h = self.pool_h(x)  # (B,C,H,1)
+        x_w = self.pool_w(x)  # (B,C,1,W)
+
+        # 广播成矩形上下文
+        s = x_h + x_w         # (B,C,H,W)
+
+        # 条带 conv 生成通道注意力
+        # step 1: horizontal conv
+        feat_h = self.conv_h(s)
+        feat_h = self.bn(feat_h)
+        feat_h = self.relu(feat_h)
+        
+        # step 2: vertical conv
+        feat_w = self.conv_w(feat_h)
+        att = self.sigmoid(feat_w)
+
+        # 返回 att*loc 以及 原始条带特征 x_h, x_w 用于深监督
+        return att * loc, x_h, x_w
+
+
+class RCM(nn.Module):
+    """Region-wise Context Module (原作者结构)"""
+    def __init__(self, dim, dw_size=11):
+        super().__init__()
+        self.token_mixer = RCA(dim, band_kernel_size=dw_size,
+                               square_kernel_size=3, ratio=1)
+        self.norm = nn.BatchNorm2d(dim)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim, dim * 2, 1),
+            nn.Identity(),
+            nn.GELU(),
+            nn.Dropout(0.0),
+            nn.Conv2d(dim * 2, dim, 1)
+        )
+        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
+
+    def forward(self, x):
+        shortcut = x
+        # 获取 mixer 输出以及条带特征
+        x_mixed, x_h, x_w = self.token_mixer(x)
+        
+        x_enc = self.mlp(self.norm(x_mixed))
+        out = shortcut + x_enc * self.gamma.view(1, -1, 1, 1)
+        
+        # 将条带特征透传出去
+        return out, x_h, x_w
+
+
+# ============== 简单 encoder + RCM + seg head ==============
+
+class SegWithRCM(nn.Module):
+    """
+    简化版分割网络：
+    encoder(4 层下采样) → RCM → seg head
+    图像大小不能太小，至少要128×128
+    """
+    def __init__(self, in_channels: int = 1,
+                 num_classes: int = 2,
+                 dim: int = 64,
+                 dw_size: int = 11):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(128, dim, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.rcm = RCM(dim, dw_size=dw_size)
+        self.head = nn.Conv2d(dim, num_classes, 3, padding=1)
+        
+        # 新增：两个方向的辅助分类头 (Auxiliary Heads for Strip Supervision)
+        # 用于将 (B, C, H, 1) -> (B, num_classes, H, 1)
+        self.head_h = nn.Conv2d(dim, num_classes, 1)
+        self.head_w = nn.Conv2d(dim, num_classes, 1)
+
+    def forward(self, x, return_att: bool = False):
+        """
+        return_att=False：返回 (logits_up, pred_h_up, pred_w_up) 用于训练
+        return_att=True： 返回 (logits_up, att_dict) 用于可视化
+        """
+        H, W = x.shape[2], x.shape[3]
+
+        # tH = (H // 128 + 127) * 128
+        # tW = (W // 128 + 127) * 128
+        # x = F.interpolate(x, size=(tH, tW), mode="bilinear", align_corners=False)   
+
+        f1 = self.enc1(x)    # (B,16,H/2,W/2)
+        f2 = self.enc2(f1)   # (B,32,H/4,W/4)
+        f3 = self.enc3(f2)   # (B,dim,H/8,W/8)
+        f4 = self.enc4(f3)   # (B,dim,H/16,W/16)
+
+        # 正常 RCM 流程，同时获取条带特征
+        y, x_h, x_w = self.rcm(f4)     # y: (B,dim,h,w), x_h: (B,dim,h,1), x_w: (B,dim,1,w)
+        
+        logits = self.head(y)
+        logits_up = F.interpolate(
+            logits, size=(H, W),
+            mode="bilinear", align_corners=False
+        )
+
+        # 如果需要返回 attention map 用于可视化 (Inference 模式)
+        if return_att:
+            # -------- 把 RCA 的 attention 逐步抠出来做可视化 --------
+            with torch.no_grad():
+                rca = self.rcm.token_mixer
+                rcm = self.rcm
+
+                # 这里为了可视化方便，重新计算一遍中间变量
+                # (实际上 x_h, x_w 已经有了，但为了保持可视化逻辑独立性，这里复用旧逻辑)
+                _x_h = rca.pool_h(f4)
+                _x_w = rca.pool_w(f4)
+                s = _x_h + _x_w
+
+                att_raw = s.mean(dim=1, keepdim=True)
+                
+                feat_h = rca.conv_h(s)
+                feat_h = rca.bn(feat_h)
+                feat_h = rca.relu(feat_h)
+                att_h = feat_h.mean(dim=1, keepdim=True)
+
+                feat_w = rca.conv_w(feat_h)
+                att_final = rca.sigmoid(feat_w)
+                att_v = att_final.mean(dim=1, keepdim=True)
+
+                loc = rca.dwconv_hw(f4)
+                token_mixer_out = att_final * loc
+                normed = rcm.norm(token_mixer_out)
+                mlp_out = rcm.mlp(normed)
+                res_after_mlp = f4 + mlp_out * rcm.gamma.view(1, -1, 1, 1)
+                att_mlp_res = res_after_mlp.mean(dim=1, keepdim=True)
+
+                def up(t):
+                    return F.interpolate(t, size=(H, W), mode="bilinear", align_corners=False)
+
+                att_dict = {
+                    "raw": up(att_raw),
+                    "after_h": up(att_h),
+                    "after_v": up(att_v),
+                    "mlp_res": up(att_mlp_res),
+                }
+            return logits_up, att_dict
+
+        # 训练模式：计算条带辅助输出
+        # x_h: (B, dim, h, 1) -> pred_h: (B, cls, h, 1) -> up: (B, cls, H, 1)
+        pred_h = self.head_h(x_h)
+        pred_h_up = F.interpolate(pred_h, size=(H, 1), mode="bilinear", align_corners=False)
+        
+        # x_w: (B, dim, 1, w) -> pred_w: (B, cls, 1, w) -> up: (B, cls, 1, W)
+        pred_w = self.head_w(x_w)
+        pred_w_up = F.interpolate(pred_w, size=(1, W), mode="bilinear", align_corners=False)
+
+        return logits_up, pred_h_up, pred_w_up
+
+
+# ----------------------------------------------------------
+# 4. 训练：加入 Strip Supervision (条带监督)
+# ----------------------------------------------------------
+def trainPhase():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dataset = FakeRectDataset(num=32, height=globalH, width=globalW)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+    model = SegWithRCM(in_channels=1, num_classes=2, dim=global_dim, dw_size=5).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+
+    num_epochs = 300
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        total = len(dataloader.dataset)
+
+        for inputs, masks in dataloader:
+            inputs = inputs.to(device)  # (B,1,H,W)
+            masks = masks.to(device)    # (B,H,W)
+
+            optimizer.zero_grad()
+            
+            # 获取主输出和两个条带辅助输出
+            outputs, strip_h_logits, strip_w_logits = model(inputs)  
+            # strip_h_logits: (B,2,H,1), strip_w_logits: (B,2,1,W)
+
+            # 1. 主 Loss
+            loss_main = criterion(outputs, masks)
+
+            # 2. 生成条带 GT
+            bin_masks = (masks > 0).long()          # 稍微防呆一下
+            target_h = bin_masks.max(dim=2)[0].float()  # (B,H)
+            target_w = bin_masks.max(dim=1)[0].float()  # (B,W)
+
+            # 用输入强度做 Hadamard 过滤（你的想法保留）
+            # inputs: (B,1,H,W)
+            row_mask = (inputs.max(dim=3)[0].squeeze(1) > 0.001).float()  # (B,H)
+            col_mask = (inputs.max(dim=2)[0].squeeze(1) > 0.001).float()   # (B,W)
+
+            target_h = target_h * row_mask
+            target_w = target_w * col_mask
+
+            # 3. 条带预测：用 概率 回归 0/1 occupancy
+            #   这里我们只取“前景通道”的概率：softmax 后的 [:,1,...]
+            prob_h = torch.softmax(strip_h_logits, dim=1)[:, 1, :, :]   # (B,H,1)
+            prob_w = torch.softmax(strip_w_logits, dim=1)[:, 1, :, :]   # (B,1,W)
+
+            prob_h = prob_h.squeeze(-1)    # (B,H)
+            prob_w = prob_w.squeeze(1)     # (B,W)
+
+            # 4. 条带 MSE Loss（也可以换成 BCEWithLogitsLoss + logits）
+            loss_h = F.mse_loss(prob_h, target_h)
+            loss_w = F.mse_loss(prob_w, target_w)
+
+            loss = loss_main + 0.2 * (loss_h + loss_w)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / total
+        if (epoch + 1) % 5 == 0:
+            print(f"[Train] Epoch {epoch+1}/{num_epochs}  Loss: {epoch_loss:.4f}")
+
+    torch.save(model.state_dict(), "rect_smooth_segnet.pth")
+    print("Model saved to rect_smooth_segnet.pth")
+
+
+# ----------------------------------------------------------
+# 5. 推理 + 可视化 strip conv 对矩形注意力的修饰效果
+# ----------------------------------------------------------
+def _to_uint8(img: np.ndarray):
+    """归一化到 0~255，防止除 0。"""
+    img = img.astype(np.float32)
+    vmin, vmax = img.min(), img.max()
+    if vmax > vmin:
+        img = (img - vmin) / (vmax - vmin)
+    else:
+        img = np.zeros_like(img)
+    return (img * 255.0).astype(np.uint8)
+
+
+def inferencePhase():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = SegWithRCM(in_channels=1, num_classes=2,
+                       dim=global_dim, dw_size=5)
+    model.load_state_dict(torch.load("rect_smooth_segnet.pth",
+                                     map_location=device))
+    model.to(device)
+    model.eval()
+
+    dataset = FakeRectDataset(num=4, height=globalH, width=globalW)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    out_dir = "inference_results_rcm"
+    os.makedirs(out_dir, exist_ok=True)
+
+    with torch.no_grad():
+        for idx, (inputs, masks) in enumerate(dataloader):
+            inputs = inputs.to(device)   # (1,1,H,W)
+            masks = masks.to(device)    # (1,H,W)
+
+            # logits_up: 分割输出
+            # att_dict:  包含 raw, after_h, after_v, mlp_res
+            logits_up, att_dict = model(inputs, return_att=True)
+
+            logits_up = nn.Softmax(dim=1)(logits_up)
+            #把概率小于0.5的logits概率设置为0,其余的保持不变
+            logits_up[logits_up < 0.5] = 0
+            
+            preds = torch.argmax(logits_up, dim=1).cpu().numpy()  # (1,H,W)
+            
+            input_np = inputs.cpu().numpy().squeeze()  # (H,W)
+            pred_np = preds.squeeze()                  # (H,W)
+            
+            att_raw_np = att_dict["raw"].cpu().numpy().squeeze()
+            att_h_np = att_dict["after_h"].cpu().numpy().squeeze()
+            att_v_np = att_dict["after_v"].cpu().numpy().squeeze()
+            att_mlp_np = att_dict["mlp_res"].cpu().numpy().squeeze()
+
+            # 画一张总览图：2行3列 (不再展示 Mask)
+            fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+
+            # Row 1: Input, Pred, MLP-Res
+            axes[0, 0].imshow(input_np, cmap="gray")
+            axes[0, 0].set_title("Input")
+            axes[0, 0].axis("off")
+
+            axes[0, 1].imshow(pred_np, cmap="gray")
+            axes[0, 1].set_title("Prediction")
+            axes[0, 1].axis("off")
+
+            axes[0, 2].imshow(att_mlp_np, cmap="jet")
+            axes[0, 2].set_title("MLP Output (after residual)")
+            axes[0, 2].axis("off")
+
+            # Row 2: Attention Raw, After H, After V
+            axes[1, 0].imshow(att_raw_np, cmap="jet")
+            axes[1, 0].set_title("Attention Raw")
+            axes[1, 0].axis("off")
+            
+            axes[1, 1].imshow(att_h_np, cmap="jet")
+            axes[1, 1].set_title("After Horizontal Conv")
+            axes[1, 1].axis("off")
+            
+            axes[1, 2].imshow(att_v_np, cmap="jet")
+            axes[1, 2].set_title("After Vertical Conv")
+            axes[1, 2].axis("off")
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"viz_progressive_{idx}.png"),
+                        dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"[Infer] Saved sample {idx} to {out_dir}/")
+
+
+if __name__ == "__main__":
+    trainPhase()
+    inferencePhase()
