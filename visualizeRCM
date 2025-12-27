@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.layers import DropPath
 from torch.utils.data import Dataset, DataLoader
 
 globalH = 256
@@ -146,28 +147,51 @@ class RCA(nn.Module):
 
 class RCM(nn.Module):
     """Region-wise Context Module (原作者结构)"""
-    def __init__(self, dim, dw_size=11):
+
+    def __init__(
+        self,
+        dim,
+        token_mixer: nn.Module = RCA,
+        norm_layer: nn.Module = nn.BatchNorm2d,
+        mlp_ratio: int = 2,
+        act_layer: nn.Module = nn.GELU,
+        ls_init_value: float = 1e-6,
+        drop_path: float = 0.0,
+        dw_size: int = 11,
+        square_kernel_size: int = 3,
+        ratio: int = 1,
+    ):
         super().__init__()
-        self.token_mixer = RCA(dim, band_kernel_size=dw_size,
-                               square_kernel_size=3, ratio=1)
-        self.norm = nn.BatchNorm2d(dim)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(dim, dim * 2, 1),
-            nn.Identity(),
-            nn.GELU(),
-            nn.Dropout(0.0),
-            nn.Conv2d(dim * 2, dim, 1)
+        self.token_mixer = token_mixer(
+            dim,
+            band_kernel_size=dw_size,
+            square_kernel_size=square_kernel_size,
+            ratio=ratio,
         )
-        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
+        self.norm = norm_layer(dim)
+        hidden_dim = int(mlp_ratio * dim)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, 1),
+            nn.Identity(),
+            act_layer(),
+            nn.Dropout(0.0),
+            nn.Conv2d(hidden_dim, dim, 1),
+        )
+        self.gamma = (
+            nn.Parameter(ls_init_value * torch.ones(dim)) if ls_init_value else None
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
         shortcut = x
         # 获取 mixer 输出以及条带特征
         x_mixed, x_h, x_w = self.token_mixer(x)
-        
+
         x_enc = self.mlp(self.norm(x_mixed))
-        out = shortcut + x_enc * self.gamma.view(1, -1, 1, 1)
-        
+        if self.gamma is not None:
+            x_enc = x_enc * self.gamma.view(1, -1, 1, 1)
+        out = self.drop_path(x_enc) + shortcut
+
         # 将条带特征透传出去
         return out, x_h, x_w
 
@@ -264,7 +288,9 @@ class SegWithRCM(nn.Module):
                 token_mixer_out = att_final * loc
                 normed = rcm.norm(token_mixer_out)
                 mlp_out = rcm.mlp(normed)
-                res_after_mlp = f4 + mlp_out * rcm.gamma.view(1, -1, 1, 1)
+                if rcm.gamma is not None:
+                    mlp_out = mlp_out * rcm.gamma.view(1, -1, 1, 1)
+                res_after_mlp = rcm.drop_path(mlp_out) + f4
                 att_mlp_res = res_after_mlp.mean(dim=1, keepdim=True)
 
                 def up(t):
