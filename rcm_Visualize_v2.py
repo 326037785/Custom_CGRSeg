@@ -366,7 +366,7 @@ def inferencePhase():
             
             # More precise thresholding strategy
             # Since we used Dice loss, probability maps are usually cleaner.
-            foreground_prob = probs[:, 1, :, :]
+            foreground_prob = torch.argmax(probs, dim=1)
             preds = (foreground_prob > 0.5).long().cpu().numpy().squeeze()
             
             input_np = inputs.cpu().numpy().squeeze()
